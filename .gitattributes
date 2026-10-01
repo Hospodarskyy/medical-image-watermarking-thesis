@@ -1,0 +1,2 @@
+# Shell-скрипти завжди з LF, інакше bash у WSL не запустить їх після checkout на Windows
+*.sh text eol=lf

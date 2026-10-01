@@ -1,5 +1,5 @@
 """
-Конвертер анотацій NIH ChestX-ray14 (BBox_List_2017.csv) у формат YOLO.
+Конвертер анотацій NIH ChestX-ray14 (BBox_List_2017.csv) у датасет формату YOLO.
 
 Вхідний формат (BBox_List_2017.csv), офіційні колонки NIH:
     Image Index, Finding Label, Bbox [x, y, w, h], (+ кілька порожніх/службових колонок)
@@ -7,35 +7,43 @@
     w, h — ширина і висота bbox у пікселях.
 Розмір зображень NIH ChestX-ray14: 1024x1024 (більшість; код бере реальний розмір з файлу).
 
-Вихідний формат YOLO (один .txt на зображення, у тому ж імені):
-    <class_id> <x_center_norm> <y_center_norm> <w_norm> <h_norm>
-усі значення нормалізовані до [0, 1] відносно розміру зображення.
+Вихід (--out, типово data/chestxray14/yolo):
+    images/{train,val}/  — копії лише анотованих знімків (знімок без .txt YOLO вважає фоном,
+                           тому тренувати на всій папці raw/images не можна)
+    labels/{train,val}/  — один .txt на зображення:
+                           <class_id> <x_center_norm> <y_center_norm> <w_norm> <h_norm>
+    data.yaml            — конфіг для Ultralytics
 
-Використання:
-    python convert_chestxray_bbox_to_yolo.py \
-        --bbox-csv BBox_List_2017.csv \
-        --images-dir ./images \
-        --labels-out ./labels \
-        --classes-out ./classes.txt
+Train/val ділиться по пацієнтах (ID пацієнта — префікс імені файлу), а не по знімках,
+щоб знімки одного пацієнта не потрапили в обидві частини.
+
+Використання (усі шляхи мають типові значення відносно кореня репозиторію):
+    python scripts/convert_chestxray_bbox_to_yolo.py
+    python scripts/convert_chestxray_bbox_to_yolo.py --val-fraction 0.2 --seed 0
 """
 
 import argparse
 import csv
-import os
+import random
+import shutil
 from pathlib import Path
+
+from yolo_utils import REPO_ROOT, reset_split_dirs, write_data_yaml
 
 try:
     from PIL import Image
 except ImportError:
     raise SystemExit("Потрібен Pillow: pip install Pillow")
 
+DATASET_DIR = REPO_ROOT / "data" / "chestxray14"
 
-def load_bboxes(bbox_csv_path: str):
+
+def load_bboxes(bbox_csv_path: Path):
     """Зчитує BBox_List_2017.csv і групує bbox-и за зображенням."""
     rows_by_image = {}
-    with open(bbox_csv_path, newline="", encoding="utf-8") as f:
+    with open(bbox_csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
-        header = next(reader)
+        next(reader)  # заголовок
         # Очікувані індекси колонок у офіційному файлі NIH:
         # 0: Image Index, 1: Finding Label, 2: Bbox [x, 3: y, 4: w, 5: h]
         for row in reader:
@@ -53,20 +61,46 @@ def build_class_map(rows_by_image):
     return {label: idx for idx, label in enumerate(labels)}
 
 
-def convert(bbox_csv: str, images_dir: str, labels_out: str, classes_out: str):
+def patient_id(image_name: str) -> str:
+    return image_name.split("_")[0]
+
+
+def pick_val_patients(image_names, val_fraction: float, seed: int):
+    """Обирає пацієнтів для val.
+
+    Рахується по всіх пацієнтах з CSV, а не лише по наявних на диску знімках,
+    тому розподіл не змінюється, коли довантажуються нові архіви.
+    """
+    patients = sorted({patient_id(name) for name in image_names})
+    random.Random(seed).shuffle(patients)
+    return set(patients[: round(len(patients) * val_fraction)])
+
+
+def to_yolo_line(class_id: int, x, y, w, h, img_w, img_h):
+    """Обрізає bbox по межах зображення і повертає рядок YOLO (або None, якщо bbox вироджений)."""
+    x1, y1 = max(x, 0.0), max(y, 0.0)
+    x2, y2 = min(x + w, img_w), min(y + h, img_h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    x_center = (x1 + x2) / 2 / img_w
+    y_center = (y1 + y2) / 2 / img_h
+    return f"{class_id} {x_center:.6f} {y_center:.6f} {(x2 - x1) / img_w:.6f} {(y2 - y1) / img_h:.6f}"
+
+
+def convert(bbox_csv: Path, images_dir: Path, out_dir: Path, val_fraction: float, seed: int):
     rows_by_image = load_bboxes(bbox_csv)
     class_map = build_class_map(rows_by_image)
+    val_patients = pick_val_patients(rows_by_image, val_fraction, seed)
 
-    os.makedirs(labels_out, exist_ok=True)
-    with open(classes_out, "w", encoding="utf-8") as f:
-        for label, idx in sorted(class_map.items(), key=lambda kv: kv[1]):
-            f.write(f"{label}\n")
+    splits = ("train", "val")
+    reset_split_dirs(out_dir, splits)
 
-    converted, skipped = 0, 0
+    counts = dict.fromkeys(splits, 0)
+    missing, bad_boxes = 0, 0
     for image_name, boxes in rows_by_image.items():
-        image_path = Path(images_dir) / image_name
+        image_path = images_dir / image_name
         if not image_path.exists():
-            skipped += 1
+            missing += 1
             continue
 
         with Image.open(image_path) as img:
@@ -74,36 +108,47 @@ def convert(bbox_csv: str, images_dir: str, labels_out: str, classes_out: str):
 
         label_lines = []
         for label, x, y, w, h in boxes:
-            class_id = class_map[label]
-            x_center = (x + w / 2) / img_w
-            y_center = (y + h / 2) / img_h
-            w_norm = w / img_w
-            h_norm = h / img_h
+            line = to_yolo_line(class_map[label], x, y, w, h, img_w, img_h)
+            if line is None:
+                bad_boxes += 1
+                continue
+            label_lines.append(line)
+        if not label_lines:
+            continue
 
-            # Захист від виходу за межі [0, 1] через похибки округлення
-            x_center = min(max(x_center, 0.0), 1.0)
-            y_center = min(max(y_center, 0.0), 1.0)
-            w_norm = min(max(w_norm, 0.0), 1.0)
-            h_norm = min(max(h_norm, 0.0), 1.0)
-
-            label_lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {w_norm:.6f} {h_norm:.6f}")
-
-        label_filename = Path(labels_out) / (image_path.stem + ".txt")
-        with open(label_filename, "w", encoding="utf-8") as f:
+        split = "val" if patient_id(image_name) in val_patients else "train"
+        shutil.copy2(image_path, out_dir / "images" / split / image_name)
+        label_path = out_dir / "labels" / split / (image_path.stem + ".txt")
+        with open(label_path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(label_lines) + "\n")
-        converted += 1
+        counts[split] += 1
 
-    print(f"Готово. Конвертовано: {converted}, пропущено (зображення не знайдено): {skipped}")
-    print(f"Класи ({len(class_map)}): {list(class_map.keys())}")
-    print(f"Файл класів збережено: {classes_out}")
+    yaml_path = write_data_yaml(out_dir, class_map, splits)
+
+    print(f"Готово. train: {counts['train']}, val: {counts['val']} знімків")
+    print(f"Класи ({len(class_map)}): {list(class_map)}")
+    print(f"Конфіг збережено: {yaml_path}")
+    if bad_boxes:
+        print(f"УВАГА: пропущено вироджених bbox: {bad_boxes}")
+    if missing:
+        print(
+            f"УВАГА: {missing} з {len(rows_by_image)} анотованих знімків не знайдено в {images_dir} "
+            "— розпакуйте решту архівів images_0XX.tar.gz і запустіть скрипт ще раз."
+        )
+    if not counts["train"] or not counts["val"]:
+        raise SystemExit("Помилка: train або val порожній — недостатньо знімків для тренування.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--bbox-csv", required=True, help="Шлях до BBox_List_2017.csv")
-    parser.add_argument("--images-dir", required=True, help="Папка з .png зображеннями")
-    parser.add_argument("--labels-out", required=True, help="Куди зберегти .txt анотації YOLO")
-    parser.add_argument("--classes-out", default="classes.txt", help="Куди зберегти список класів")
+    parser.add_argument("--bbox-csv", type=Path, default=DATASET_DIR / "raw" / "BBox_List_2017.csv",
+                        help="Шлях до BBox_List_2017.csv")
+    parser.add_argument("--images-dir", type=Path, default=DATASET_DIR / "raw" / "images",
+                        help="Папка з розпакованими .png зображеннями")
+    parser.add_argument("--out", type=Path, default=DATASET_DIR / "yolo",
+                        help="Куди зберегти YOLO-датасет (images/, labels/, data.yaml)")
+    parser.add_argument("--val-fraction", type=float, default=0.2, help="Частка пацієнтів у val")
+    parser.add_argument("--seed", type=int, default=0, help="Seed для розподілу пацієнтів")
     args = parser.parse_args()
 
-    convert(args.bbox_csv, args.images_dir, args.labels_out, args.classes_out)
+    convert(args.bbox_csv, args.images_dir, args.out, args.val_fraction, args.seed)
