@@ -11,7 +11,7 @@ FracAtlas уже має анотації у форматі YOLO (Annotations/YOL
 Вихід (--out, типово data/fracatlas/yolo):
     images/{train,val,test}/
     labels/{train,val,test}/
-    data.yaml
+    data.yaml, classes.txt
 
 Використання:
     python scripts/prepare_fracatlas_yolo.py

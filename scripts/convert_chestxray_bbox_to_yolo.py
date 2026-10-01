@@ -8,18 +8,19 @@
 Розмір зображень NIH ChestX-ray14: 1024x1024 (більшість; код бере реальний розмір з файлу).
 
 Вихід (--out, типово data/chestxray14/yolo):
-    images/{train,val}/  — копії лише анотованих знімків (знімок без .txt YOLO вважає фоном,
+    images/{train,val,test}/  — копії лише анотованих знімків (знімок без .txt YOLO вважає фоном,
                            тому тренувати на всій папці raw/images не можна)
-    labels/{train,val}/  — один .txt на зображення:
+    labels/{train,val,test}/  — один .txt на зображення:
                            <class_id> <x_center_norm> <y_center_norm> <w_norm> <h_norm>
-    data.yaml            — конфіг для Ultralytics
+    data.yaml, classes.txt — конфіг для Ultralytics і список класів (рядок = class_id)
 
-Train/val ділиться по пацієнтах (ID пацієнта — префікс імені файлу), а не по знімках,
-щоб знімки одного пацієнта не потрапили в обидві частини.
+Train/val/test ділиться по пацієнтах (ID пацієнта — префікс імені файлу), а не по знімках,
+щоб знімки одного пацієнта не потрапили в різні частини. test не бере участі в тренуванні
+й підборі гіперпараметрів — це незалежний набір для фінальної оцінки.
 
 Використання (усі шляхи мають типові значення відносно кореня репозиторію):
     python scripts/convert_chestxray_bbox_to_yolo.py
-    python scripts/convert_chestxray_bbox_to_yolo.py --val-fraction 0.2 --seed 0
+    python scripts/convert_chestxray_bbox_to_yolo.py --val-fraction 0.15 --test-fraction 0.15 --seed 0
 """
 
 import argparse
@@ -65,15 +66,20 @@ def patient_id(image_name: str) -> str:
     return image_name.split("_")[0]
 
 
-def pick_val_patients(image_names, val_fraction: float, seed: int):
-    """Обирає пацієнтів для val.
+def assign_patient_splits(image_names, val_fraction: float, test_fraction: float, seed: int):
+    """Розподіляє пацієнтів на train/val/test, повертає пацієнт -> частина.
 
     Рахується по всіх пацієнтах з CSV, а не лише по наявних на диску знімках,
     тому розподіл не змінюється, коли довантажуються нові архіви.
     """
     patients = sorted({patient_id(name) for name in image_names})
     random.Random(seed).shuffle(patients)
-    return set(patients[: round(len(patients) * val_fraction)])
+    n_val = round(len(patients) * val_fraction)
+    n_test = round(len(patients) * test_fraction)
+    return {
+        patient: "val" if idx < n_val else "test" if idx < n_val + n_test else "train"
+        for idx, patient in enumerate(patients)
+    }
 
 
 def to_yolo_line(class_id: int, x, y, w, h, img_w, img_h):
@@ -87,12 +93,12 @@ def to_yolo_line(class_id: int, x, y, w, h, img_w, img_h):
     return f"{class_id} {x_center:.6f} {y_center:.6f} {(x2 - x1) / img_w:.6f} {(y2 - y1) / img_h:.6f}"
 
 
-def convert(bbox_csv: Path, images_dir: Path, out_dir: Path, val_fraction: float, seed: int):
+def convert(bbox_csv: Path, images_dir: Path, out_dir: Path, val_fraction: float, test_fraction: float, seed: int):
     rows_by_image = load_bboxes(bbox_csv)
     class_map = build_class_map(rows_by_image)
-    val_patients = pick_val_patients(rows_by_image, val_fraction, seed)
+    split_by_patient = assign_patient_splits(rows_by_image, val_fraction, test_fraction, seed)
 
-    splits = ("train", "val")
+    splits = ("train", "val", "test")
     reset_split_dirs(out_dir, splits)
 
     counts = dict.fromkeys(splits, 0)
@@ -116,7 +122,7 @@ def convert(bbox_csv: Path, images_dir: Path, out_dir: Path, val_fraction: float
         if not label_lines:
             continue
 
-        split = "val" if patient_id(image_name) in val_patients else "train"
+        split = split_by_patient[patient_id(image_name)]
         shutil.copy2(image_path, out_dir / "images" / split / image_name)
         label_path = out_dir / "labels" / split / (image_path.stem + ".txt")
         with open(label_path, "w", encoding="utf-8", newline="\n") as f:
@@ -125,7 +131,7 @@ def convert(bbox_csv: Path, images_dir: Path, out_dir: Path, val_fraction: float
 
     yaml_path = write_data_yaml(out_dir, class_map, splits)
 
-    print(f"Готово. train: {counts['train']}, val: {counts['val']} знімків")
+    print("Готово. " + ", ".join(f"{split}: {n}" for split, n in counts.items()) + " знімків")
     print(f"Класи ({len(class_map)}): {list(class_map)}")
     print(f"Конфіг збережено: {yaml_path}")
     if bad_boxes:
@@ -135,8 +141,8 @@ def convert(bbox_csv: Path, images_dir: Path, out_dir: Path, val_fraction: float
             f"УВАГА: {missing} з {len(rows_by_image)} анотованих знімків не знайдено в {images_dir} "
             "— розпакуйте решту архівів images_0XX.tar.gz і запустіть скрипт ще раз."
         )
-    if not counts["train"] or not counts["val"]:
-        raise SystemExit("Помилка: train або val порожній — недостатньо знімків для тренування.")
+    if not all(counts.values()):
+        raise SystemExit("Помилка: train, val або test порожній — недостатньо знімків для тренування.")
 
 
 if __name__ == "__main__":
@@ -147,8 +153,9 @@ if __name__ == "__main__":
                         help="Папка з розпакованими .png зображеннями")
     parser.add_argument("--out", type=Path, default=DATASET_DIR / "yolo",
                         help="Куди зберегти YOLO-датасет (images/, labels/, data.yaml)")
-    parser.add_argument("--val-fraction", type=float, default=0.2, help="Частка пацієнтів у val")
+    parser.add_argument("--val-fraction", type=float, default=0.15, help="Частка пацієнтів у val")
+    parser.add_argument("--test-fraction", type=float, default=0.15, help="Частка пацієнтів у test")
     parser.add_argument("--seed", type=int, default=0, help="Seed для розподілу пацієнтів")
     args = parser.parse_args()
 
-    convert(args.bbox_csv, args.images_dir, args.out, args.val_fraction, args.seed)
+    convert(args.bbox_csv, args.images_dir, args.out, args.val_fraction, args.test_fraction, args.seed)

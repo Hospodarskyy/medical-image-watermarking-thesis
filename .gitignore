@@ -3,6 +3,9 @@ data/
 
 # Результати тренувань і ваги моделей
 runs/
+mlflow.db
+mlartifacts/
+mlruns/
 *.pt
 *.pth
 *.onnx
@@ -18,3 +21,6 @@ venv/
 CLAUDE.md
 .claude/settings.local.json
 .env
+
+# Тести
+test/

@@ -15,7 +15,10 @@ def reset_split_dirs(out_dir: Path, splits):
 
 
 def write_data_yaml(out_dir: Path, class_names, splits):
-    """Пише data.yaml для Ultralytics.
+    """Пише data.yaml для Ultralytics і classes.txt (назва класу в рядку = class_id з 0).
+
+    class_id у файлах міток завжди відповідає цьому списку, навіть якщо детектор RoI
+    тренується з single_cls і класи ігнорує.
 
     Шлях до датасету абсолютний: відносний Ultralytics шукав би у власній
     datasets_dir, а не відносно репозиторію. Після перенесення даних (напр. у WSL)
@@ -30,4 +33,5 @@ def write_data_yaml(out_dir: Path, class_names, splits):
     lines.append("names:")
     lines += [f"  {idx}: {name}" for idx, name in enumerate(class_names)]
     yaml_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    (out_dir / "classes.txt").write_text("\n".join(class_names) + "\n", encoding="utf-8", newline="\n")
     return yaml_path
