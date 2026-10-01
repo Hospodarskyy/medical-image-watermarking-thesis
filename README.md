@@ -85,12 +85,14 @@ python scripts/train_yolo.py chestxray14 --fraction 0.1 --epochs 5 --name sanity
 # повне тренування
 python scripts/train_yolo.py chestxray14 --epochs 100
 # фінальна оцінка на незалежному test
-python scripts/train_yolo.py chestxray14 --eval-test runs/chestxray14/yolov8n/weights/best.pt
+python scripts/train_yolo.py chestxray14 --eval-test runs/chestxray14/yolov8n-20261001-2315/weights/best.pt
 ```
 
 Типово всі класи патологій зводяться до одного класу "RoI" (`single_cls`); окремі класи
 лишає `--multi-class`. Модель обирається через `--model` (типово `yolov8n.pt`).
-Результати пишуться в `runs/<датасет>/<name>/` (не в git).
+Результати пишуться в `runs/<датасет>/<назва>-<дата>-<час>/` (не в git), наприклад
+`runs/chestxray14/yolov8n-20261001-2315/`. Назва — це `--name` або, якщо його немає, назва моделі;
+дата й час старту додаються завжди, тож папка на диску і запуск у MLflow називаються однаково.
 
 ### Логування експериментів (MLflow)
 
@@ -102,7 +104,7 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db    # http://127.0.0.1:5000
 Якщо MLflow встановлено, `train_yolo.py` логує кожен запуск в експеримент
 `roi-detector/<датасет>`: гіперпараметри, метрики по епохах (loss, mAP, precision, recall, lr),
 ваги й графіки, а також теги `dataset`, `stage` (`train`/`test`) і `git_commit`.
-`--eval-test` створює окремий запуск `<name>-test` з метриками `test/*`.
+`--eval-test` створює окремий запуск `<назва тренувального запуску>-test` з метриками `test/*`.
 База — `mlflow.db`, артефакти — `mlartifacts/` у корені репозиторію (обидва не в git);
 інше місце задається змінною `MLFLOW_TRACKING_URI`. Без MLflow скрипт працює як раніше.
 

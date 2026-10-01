@@ -8,7 +8,10 @@
 Типово всі класи патологій зводяться до одного класу "RoI" (single_cls): для водяного
 маркування потрібне лише розташування області інтересу, а не тип патології.
 
-Результати (ваги, графіки, метрики) пишуться в runs/<датасет>/<name>/.
+Результати (ваги, графіки, метрики) пишуться в runs/<датасет>/<назва>-<дата>-<час>/,
+напр. runs/chestxray14/yolov8n-20261001-2315/. Назва — це --name або, якщо його немає,
+назва моделі; дата й час старту додаються завжди, тому запуски не перезаписують один
+одного, а папка на диску й запуск у MLflow називаються однаково.
 
 Якщо встановлено MLflow (pip install mlflow), кожен запуск додатково логується в
 експеримент "roi-detector/<датасет>": гіперпараметри, метрики по епохах, ваги та графіки —
@@ -23,13 +26,14 @@
     # повне тренування
     python scripts/train_yolo.py chestxray14 --epochs 100
     # фінальна оцінка на test
-    python scripts/train_yolo.py chestxray14 --eval-test runs/chestxray14/yolov8n/weights/best.pt
+    python scripts/train_yolo.py chestxray14 --eval-test runs/chestxray14/yolov8n-20261001-2315/weights/best.pt
 """
 
 import argparse
 import os
 import subprocess
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 from yolo_utils import REPO_ROOT
@@ -88,7 +92,7 @@ def mlflow_run(dataset: str, run_name: str, stage: str):
 
 
 def train(args):
-    run_name = args.name or Path(args.model).stem
+    run_name = f"{args.name or Path(args.model).stem}-{datetime.now():%Y%m%d-%H%M}"
     model = YOLO(args.model)
     with mlflow_run(args.dataset, run_name, stage="train"):
         model.train(
@@ -143,7 +147,8 @@ if __name__ == "__main__":
     parser.add_argument("--multi-class", action="store_true",
                         help="Лишити окремі класи патологій замість одного класу RoI")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--name", default=None, help="Назва запуску в runs/<датасет>/ (типово — назва моделі)")
+    parser.add_argument("--name", default=None, help="Назва запуску в runs/<датасет>/ і в MLflow (типово — назва моделі); "
+                             "дата й час старту додаються до неї завжди")
     parser.add_argument("--eval-test", type=Path, default=None, metavar="WEIGHTS",
                         help="Не тренувати, а оцінити вказані ваги на test")
     args = parser.parse_args()
