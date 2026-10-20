@@ -14,6 +14,7 @@ MASTERS_DIPLOMA/
 │   ├── prepare_fracatlas_yolo.py           # розкладка FracAtlas за офіційним сплітом
 │   ├── convert_vindr_spinexr_to_yolo.py    # DICOM + CSV VinDr-SpineXR -> YOLO-датасет (WBF, офіційний test)
 │   ├── train_yolo.py                       # тренування YOLO-детектора RoI та оцінка на test
+│   ├── analyze_roi_recall.py               # recall по типах уражень, FROC, ROC на рівні знімка
 │   └── yolo_utils.py                       # спільні функції (структура папок, data.yaml)
 └── data/                      # датасети (не в git — див. .gitignore)
     ├── chestxray14/
@@ -86,10 +87,22 @@ python scripts/train_yolo.py chestxray14 --fraction 0.1 --epochs 5 --name sanity
 python scripts/train_yolo.py chestxray14 --epochs 100
 # фінальна оцінка на незалежному test
 python scripts/train_yolo.py chestxray14 --eval-test runs/chestxray14/yolov8n-20261001-2315/weights/best.pt
+# окремі класи з вагами проти дисбалансу
+python scripts/train_yolo.py chestxray14 --epochs 50 --multi-class --cls-pw 0.5
+# оцінка вже натренованих ваг на val як детектора RoI (напр. для старих запусків)
+python scripts/train_yolo.py chestxray14 --eval-val runs/chestxray14/yolov8n-20261001-2315/weights/best.pt
 ```
 
 Типово всі класи патологій зводяться до одного класу "RoI" (`single_cls`); окремі класи
-лишає `--multi-class`. Модель обирається через `--model` (типово `yolov8n.pt`).
+лишає `--multi-class`, а `--cls-pw` (0–1, лише з `--multi-class`) додає ваги класів проти
+дисбалансу. Модель обирається через `--model` (типово `yolov8n.pt`).
+
+**Як порівнювати моделі.** mAP багатокласової моделі під час тренування — середнє по класах,
+і з mAP одноклассової він не порівнюваний. Тому після кожного тренування `best.pt` додатково
+оцінюється на val як детектор RoI: клас ігнорується, рахується лише, чи знайдено область
+(метрики `roi_val/*` у MLflow, графіки в `runs/<датасет>/<запуск>/roi-val/`). Порівнювати
+будь-які моделі між собою — саме за `roi_val/*`. Так само як детектор RoI оцінюють
+`--eval-val` і `--eval-test`; `--imgsz` для них типово береться той, з яким модель тренувалась.
 Результати пишуться в `runs/<датасет>/<назва>-<дата>-<час>/` (не в git), наприклад
 `runs/chestxray14/yolov8n-20261001-2315/`. Назва — це `--name` або, якщо його немає, назва моделі;
 дата й час старту додаються завжди, тож папка на диску і запуск у MLflow називаються однаково.
@@ -104,9 +117,37 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db    # http://127.0.0.1:5000
 Якщо MLflow встановлено, `train_yolo.py` логує кожен запуск в експеримент
 `roi-detector/<датасет>`: гіперпараметри, метрики по епохах (loss, mAP, precision, recall, lr),
 ваги й графіки, а також теги `dataset`, `stage` (`train`/`test`) і `git_commit`.
-`--eval-test` створює окремий запуск `<назва тренувального запуску>-test` з метриками `test/*`.
+`--eval-val` / `--eval-test` створюють окремі запуски `<назва тренувального запуску>-val` / `-test`
+з метриками `roi_val/*` / `roi_test/*` і параметрами `train.*` (модель, епохи, imgsz, single_cls,
+cls_pw, seed) з чекпойнта.
 База — `mlflow.db`, артефакти — `mlartifacts/` у корені репозиторію (обидва не в git);
 інше місце задається змінною `MLFLOW_TRACKING_URI`. Без MLflow скрипт працює як раніше.
+
+### Аугментація
+
+`--aug` обирає пресет: `default` (типові Ultralytics, розраховані на фото COCO: mosaic 1.0,
+віддзеркалення, масштаб 0.5–1.5×), `xray` (без mosaic і віддзеркалення, масштаб ±20%, зсув 5%,
+поворот ±5°, яскравість ±20%), `xray-mosaic` (те саме з mosaic 0.5) або `nomosaic` (default без mosaic). Пресет пишеться в
+тег `aug` у MLflow.
+
+### Аналіз детектора: recall по типах уражень, FROC, ROC
+
+```bash
+python scripts/analyze_roi_recall.py chestxray14 runs/chestxray14/<запуск>/weights/best.pt
+```
+
+Запускається автоматично після кожного тренування та в `--eval-val` / `--eval-test`;
+окремо — для старих запусків. Рахує:
+- **recall по типах уражень і площі bbox** при кількох порогах `--conf` і `--iou` (клас
+  передбачення ігнорується), частку знімків без жодної RoI і кількість RoI на знімок;
+- **FROC** — частка знайдених уражень залежно від кількості хибних RoI на знімок (стандартна
+  крива для детекції уражень у медичних зображеннях), плюс CPM — середня sensitivity при
+  1/8…8 хибних RoI на знімок. Не залежить від вибору порогу conf;
+- **ROC на рівні знімка** ("чи є ураження", оцінка — найвища впевненість RoI) — лише там, де є
+  знімки без уражень (VinDr-SpineXR); у val ChestX-ray14 і FracAtlas таких немає.
+
+Файли (`roi-recall-<частина>.csv`, `froc-<частина>.png`, `roc-<частина>.png`) — поруч з вагами;
+у MLflow — метрики `roi_val/*` і артефакти `roi-analysis-val/` у запуску тренування.
 
 ## FracAtlas
 

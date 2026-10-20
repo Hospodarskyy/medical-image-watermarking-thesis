@@ -1,9 +1,15 @@
 """Спільні функції для підготовки датасетів у форматі Ultralytics YOLO."""
 
+import os
 import shutil
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def mlflow_tracking_uri() -> str:
+    """База MLflow: змінна MLFLOW_TRACKING_URI або mlflow.db у корені репозиторію."""
+    return os.environ.get("MLFLOW_TRACKING_URI") or f"sqlite:///{(REPO_ROOT / 'mlflow.db').as_posix()}"
 
 
 def reset_split_dirs(out_dir: Path, splits):
