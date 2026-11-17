@@ -37,6 +37,11 @@ r(c) = max(1, sqrt(T / f(c))); знімок повторюється стіль�
     xray-mosaic  — те саме, але mosaic 0.5: компроміс, якщо без mosaic швидко перенавчається
     nomosaic     — default без mosaic: решта стандартної аугментації (fliplr, scale 0.5,
                    translate, hsv_v) лишається як регуляризація
+    lowscale     — default зі scale 0.25 (0.75–1.25× замість 0.5–1.5×): окремо ефект масштабу,
+                   який зменшує й так дрібні ураження
+    spine        — для рентгену хребта: mosaic 0.5, scale 0.25 (0.75–1.25×, щоб не зменшувати
+                   й так дрібні ураження вдвічі), поворот ±5° (нахил хребта), яскравість ±20%;
+                   віддзеркалення лишається (на прямих знімках хребет майже симетричний)
 Для FracAtlas віддзеркалення анатомічно допустиме (ліва/права кінцівка), для грудної клітки
 й хребта — ні.
 
@@ -52,6 +57,13 @@ r(c) = max(1, sqrt(T / f(c))); знімок повторюється стіль�
 репозиторію, артефакти — mlartifacts/ (інше місце: змінна MLFLOW_TRACKING_URI).
 Перегляд: mlflow ui --backend-store-uri sqlite:///mlflow.db  ->  http://127.0.0.1:5000
 
+Перерване тренування (Ctrl+C, вимкнення ПК) продовжується з --resume: Ultralytics після кожної
+епохи зберігає weights/last.pt зі станом оптимізатора, номером епохи й EMA, тож тренування
+йде далі з наступної епохи з тими самими налаштуваннями — у тій самій папці runs/ і в тому
+самому запуску MLflow, а після останньої епохи, як завжди, рахується оцінка RoI на val.
+Епоха, на якій тренування перервано, втрачається й проходиться заново. --tta треба вказати
+знову, якщо він був; --workers можна змінити, решту налаштувань береться з last.pt.
+
 Використання:
     # sanity check: 10% train-знімків, 5 епох
     python scripts/train_yolo.py chestxray14 --fraction 0.1 --epochs 5 --name sanity
@@ -64,6 +76,8 @@ r(c) = max(1, sqrt(T / f(c))); знімок повторюється стіль�
     # більша модель, більший вхід, довше, частіше рідкісні ураження, оптимізатор зафіксовано
     python scripts/train_yolo.py vindr-spinexr --model yolov8s.pt --imgsz 1536 --batch 8 --epochs 80 \
         --oversample-rare 0.1 --optimizer AdamW --lr0 0.002 --tta
+    # продовжити перерване тренування
+    python scripts/train_yolo.py vindr-spinexr --resume runs/vindr-spinexr/v8s-e80-img1536-rfs-20261117-1211 --tta
     # фінальна оцінка на test — лише для остаточно обраної моделі
     python scripts/train_yolo.py chestxray14 --eval-test runs/chestxray14/yolov8n-20261001-2315/weights/best.pt
 """
@@ -78,7 +92,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from analyze_roi_recall import IMAGE_SUFFIXES, analyze, log_to_mlflow
+from analyze_roi_recall import IMAGE_SUFFIXES, analyze, find_mlflow_run, log_to_mlflow
 from yolo_utils import REPO_ROOT, mlflow_tracking_uri
 
 try:
@@ -100,6 +114,8 @@ AUG_PRESETS = {
     "xray": XRAY_AUG,
     "xray-mosaic": {**XRAY_AUG, "mosaic": 0.5},
     "nomosaic": {"mosaic": 0.0},
+    "lowscale": {"scale": 0.25},
+    "spine": {"mosaic": 0.5, "scale": 0.25, "degrees": 5.0, "hsv_h": 0.0, "hsv_s": 0.0, "hsv_v": 0.2},
 }
 
 
@@ -116,8 +132,10 @@ def git_commit() -> str:
 
 
 @contextmanager
-def mlflow_run(dataset: str, run_name: str, stage: str, tags: dict = None):
+def mlflow_run(dataset: str, run_name: str, stage: str, tags: dict = None, run_id: str = None):
     """Відкриває запуск MLflow в експерименті датасету; без встановленого MLflow нічого не робить.
+
+    З run_id продовжує вже наявний запуск (--resume) і лишає його початкові теги.
 
     Вбудований callback Ultralytics під час тренування підхоплює вже активний запуск і пише
     в нього параметри, метрики та артефакти. Експеримент і запуск він шукає через змінні
@@ -138,8 +156,10 @@ def mlflow_run(dataset: str, run_name: str, stage: str, tags: dict = None):
         # явне розташування артефактів: типове залежало б від папки, з якої запущено скрипт
         mlflow.create_experiment(experiment, artifact_location=(REPO_ROOT / "mlartifacts" / dataset).as_uri())
     mlflow.set_experiment(experiment)
-    with mlflow.start_run(run_name=run_name) as run:
-        mlflow.set_tags({"dataset": dataset, "stage": stage, "git_commit": git_commit(), **(tags or {})})
+    with mlflow.start_run(**({"run_id": run_id} if run_id else {"run_name": run_name})) as run:
+        if not run_id:
+            mlflow.set_tags({"dataset": dataset, "stage": stage, "git_commit": git_commit()})
+        mlflow.set_tags(tags or {})
         yield run
 
 
@@ -233,15 +253,48 @@ def train(args):
             project=str(REPO_ROOT / "runs" / args.dataset),
             name=run_name,
         )
-        run_dir = Path(model.trainer.save_dir)
-        _, results = evaluate_roi(YOLO(model.trainer.best), args.dataset, "val", imgsz, args, run_dir / "roi-val")
-        analyses = [analyze(args.dataset, Path(model.trainer.best), "val", imgsz=imgsz, batch=args.batch, tta=tta)
-                    for tta in ([False, True] if args.tta else [False])]
-        if run:
-            mlflow.log_metrics({f"roi_val/{key}": value for key, value in results.items()})
-            for analysis in analyses:
-                log_to_mlflow(analysis)
+        evaluate_trained(model, args, imgsz, run)
+
+
+def evaluate_trained(model, args, imgsz: int, run):
+    """Після тренування: best.pt на val як детектор RoI і аналіз пропусків — у той самий запуск MLflow."""
+    run_dir = Path(model.trainer.save_dir)
+    _, results = evaluate_roi(YOLO(model.trainer.best), args.dataset, "val", imgsz, args, run_dir / "roi-val")
+    analyses = [analyze(args.dataset, Path(model.trainer.best), "val", imgsz=imgsz, batch=args.batch, tta=tta)
+                for tta in ([False, True] if args.tta else [False])]
+    if run:
+        mlflow.log_metrics({f"roi_val/{key}": value for key, value in results.items()})
+        for analysis in analyses:
+            log_to_mlflow(analysis)
     print_results("val", results)
+
+
+def resume(args):
+    """Продовжує перерване тренування з last.pt (див. опис модуля)."""
+    last = args.resume.resolve()
+    if last.is_dir():  # передано папку запуску runs/<датасет>/<запуск>/
+        last = last / "weights" / "last.pt"
+    if not last.exists():
+        raise SystemExit(f"Немає {last}")
+    model = YOLO(last)
+    ckpt = getattr(model, "ckpt", None) or {}
+    if ckpt.get("optimizer") is None:  # інакше Ultralytics мовчки почав би нове тренування
+        raise SystemExit(f"{last} — ваги вже завершеного тренування, продовжувати нічого")
+    train_args = ckpt.get("train_args", {})
+    run_name = last.parent.parent.name
+    args.batch = train_args.get("batch", args.batch)  # для оцінки після тренування — як у тренуванні
+    run_id = find_mlflow_run(args.dataset, run_name) if mlflow else None
+    if mlflow and run_id is None:
+        print(f"У MLflow немає запуску {run_name} — буде створено новий з цією назвою.")
+    print(f"Продовження {run_name} з епохи {ckpt.get('epoch', -1) + 2} з {train_args.get('epochs')}")
+    with mlflow_run(args.dataset, run_name, stage="train", tags={"resumed": "true"}, run_id=run_id) as run:
+        if run:
+            # Ultralytics на старті знову логує всі аргументи тренування, а model і resume тепер інші:
+            # MLflow не дає змінювати параметри, і callback Ultralytics вимикає логування епох.
+            # Запуск уже відкрито тут, тож логування вмикається назад перед першою епохою.
+            model.add_callback("on_train_start", lambda trainer: setattr(trainer, "_mlflow_active", True))
+        model.train(resume=True, workers=args.workers)
+        evaluate_trained(model, args, train_args.get("imgsz", 640), run)
 
 
 def evaluate(args, split: str, weights: Path):
@@ -290,7 +343,7 @@ if __name__ == "__main__":
                         help="Ваги класів проти дисбалансу: 0 — вимкнено, 1 — обернено пропорційні частоті "
                              "класу (Ultralytics cls_pw). Лише разом з --multi-class")
     parser.add_argument("--aug", choices=AUG_PRESETS, default="default",
-                        help="Пресет аугментації: default (Ultralytics), xray, xray-mosaic, nomosaic — див. опис вище")
+                        help="Пресет аугментації: default (Ultralytics), xray, xray-mosaic, nomosaic, lowscale, spine — див. опис вище")
     parser.add_argument("--oversample-rare", type=float, default=0.0, metavar="T",
                         help="Repeat factor sampling: частіше показувати знімки з рідкісними ураженнями "
                              "(типове значення для спроби — 0.1; 0 — вимкнено)")
@@ -303,6 +356,9 @@ if __name__ == "__main__":
     parser.add_argument("--name", default=None, help="Назва запуску в runs/<датасет>/ і в MLflow (типово — назва моделі); "
                              "дата й час старту додаються до неї завжди")
     evaluation = parser.add_mutually_exclusive_group()
+    evaluation.add_argument("--resume", type=Path, default=None, metavar="RUN",
+                            help="Продовжити перерване тренування: папка запуску runs/<датасет>/<запуск>/ "
+                                 "або її weights/last.pt (налаштування беруться звідти, --tta — вказати знову)")
     evaluation.add_argument("--eval-val", type=Path, default=None, metavar="WEIGHTS",
                             help="Не тренувати, а оцінити вказані ваги на val як детектор RoI")
     evaluation.add_argument("--eval-test", type=Path, default=None, metavar="WEIGHTS",
@@ -318,7 +374,9 @@ if __name__ == "__main__":
     if args.lr0 is not None and args.optimizer == "auto":
         parser.error("--lr0 з --optimizer auto ігнорується Ultralytics — задайте й --optimizer")
 
-    if args.eval_val:
+    if args.resume:
+        resume(args)
+    elif args.eval_val:
         evaluate(args, "val", args.eval_val)
     elif args.eval_test:
         evaluate(args, "test", args.eval_test)
