@@ -1,5 +1,6 @@
 """
-Аналіз детектора RoI: recall по типах уражень і розміру bbox, FROC та ROC на рівні знімка.
+Аналіз детектора RoI: recall по типах уражень і розміру bbox, FROC, ROC на рівні знімка
+та покриття уражень RoI-ами.
 
 Детектор тренується з одним класом "RoI", тому його mAP не каже, які саме ураження він
 пропускає і скільки зайвих RoI дає. Скрипт проганяє ваги по знімках частини датасету
@@ -20,8 +21,22 @@
 3. ROC на рівні знімка — "чи є на знімку ураження", оцінка знімка = найвища впевненість
    RoI на ньому. Можлива лише там, де є знімки без уражень (VinDr-SpineXR); у val
    ChestX-ray14 і FracAtlas таких знімків немає, тоді ROC пропускається.
+4. Покриття уражень — головна метрика для водяного маркування. IoU карає за завелику
+   рамку, хоча для маркування важливо інше: чи потрапило ураження всередину RoI (тоді воно
+   отримає крихкий маркер). Ураження вважається захищеним, якщо щонайменше --cover (типово
+   90%) його площі лежить усередині об'єднання RoI: площа(ураження ∩ ⋃RoI) / площа(ураження).
+   Ціна — частка площі знімка під RoI: вона забирає місце в RoNI для стійкого маркера і
+   бітів відновлення. Рахується для сітки порогів conf і розширення рамок (кожна рамка
+   збільшується на N% своєї ширини й висоти з кожного боку). Площі рахуються точно
+   (стиснення координат), без растеризації.
 
-Вихід: таблиці в консолі; roi-recall-<частина>.csv, froc-<частина>.png, roc-<частина>.png
+З --tta передбачення робляться з аугментацією на інференсі (Ultralytics augment=True:
+віддзеркалення й кілька масштабів, результати об'єднуються). Без перенавчання це підвищує
+частку знайдених уражень ціною ~3× повільнішого передбачення. Метрики тоді пишуться з
+префіксом roi_<частина>_tta/, файли — з суфіксом -tta, щоб не змішувати з базовими.
+
+Вихід: таблиці в консолі; roi-recall-<частина>.csv, froc-<частина>.png, roc-<частина>.png,
+roi-coverage-<частина>.csv, roi-coverage-<частина>.png
 поруч з вагами (runs/<датасет>/<запуск>/). Якщо встановлено MLflow і знайдено запуск
 тренування з такою самою назвою (для test — <назва>-test), метрики roi_<частина>/* і
 файли записуються в нього (артефакти roi-analysis-<частина>/). train_yolo.py викликає
@@ -30,6 +45,7 @@
 Використання:
     python scripts/analyze_roi_recall.py chestxray14 runs/chestxray14/<запуск>/weights/best.pt
     python scripts/analyze_roi_recall.py chestxray14 <ваги> --conf 0.25 0.1 0.01 --iou 0.5 0.3 0.1
+    python scripts/analyze_roi_recall.py vindr-spinexr <ваги> --tta
 """
 
 import argparse
@@ -63,6 +79,10 @@ AREA_BINS = [(0.0, 0.01, "< 1%"), (0.01, 0.05, "1–5%"), (0.05, 0.15, "5–15%"
 MIN_CONF = 0.001
 FROC_FP_RATES = (0.125, 0.25, 0.5, 1, 2, 4, 8)
 FROC_IOUS = (0.5, 0.3)
+# покриття: розширення рамок (частка ширини/висоти з кожного боку) і пороги conf
+COVERAGE_PADS = (0.0, 0.1, 0.25, 0.5)
+COVERAGE_TABLE_CONFS = (0.25, 0.1, 0.05)  # точки, що йдуть у таблицю й метрики MLflow
+COVERAGE_CURVE_CONFS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.07, 0.05, 0.03, 0.02, 0.01)
 
 
 def load_ground_truth(labels_dir: Path):
@@ -98,18 +118,27 @@ def output_dir(dataset: str, weights: Path) -> Path:
     return REPO_ROOT / "runs" / dataset / weights.stem
 
 
-def predict(weights: Path, images: list, imgsz, batch: int):
-    """Повертає (image_stem -> (bbox-и N x 4 нормалізовані, впевненості N), imgsz)."""
+def predict(weights: Path, images: list, imgsz, batch: int, augment: bool = False):
+    """Повертає (image_stem -> (bbox-и N x 4 нормалізовані, впевненості N), imgsz).
+
+    augment=True — TTA: кожен знімок проганяється у кількох масштабах і з віддзеркаленням,
+    тому порції вдвічі менші, щоб уміститись у пам'ять GPU.
+    """
     model = YOLO(weights)
     if imgsz is None:
         imgsz = (getattr(model, "ckpt", None) or {}).get("train_args", {}).get("imgsz", 640)
+    # розігрів: перший виклик повільний (ініціалізація CUDA/NMS) і може перевищити ліміт часу
+    # NMS в Ultralytics, через що передбачення частини знімків батчу обрізаються
+    model.predict(source=[str(images[0])], imgsz=imgsz, conf=MIN_CONF, verbose=False)
     predictions = {}
     # Список шляхів Ultralytics завантажує в пам'ять цілим, як один батч, і параметр batch
     # ігнорує; для 854 знімків VinDr-SpineXR у повній роздільності це ~10 ГБ RAM. Тому порціями.
-    for start in range(0, len(images), batch):
-        chunk = [str(p) for p in images[start:start + batch]]
+    chunk_size = max(1, batch // 2) if augment else batch
+    for start in range(0, len(images), chunk_size):
+        chunk = [str(p) for p in images[start:start + chunk_size]]
         # agnostic_nms: класи ігноруються і при придушенні дублікатів, як у детекторі RoI
-        for result in model.predict(source=chunk, imgsz=imgsz, conf=MIN_CONF, agnostic_nms=True, verbose=False):
+        for result in model.predict(source=chunk, imgsz=imgsz, conf=MIN_CONF, agnostic_nms=True, augment=augment,
+                                    verbose=False):
             predictions[Path(result.path).stem] = (result.boxes.xyxyn.cpu().numpy().astype(np.float64),
                                                    result.boxes.conf.cpu().numpy().astype(np.float64))
     return predictions, imgsz
@@ -186,6 +215,55 @@ def sensitivity_at(fp_per_image, sensitivity, rate: float) -> float:
     return float(sensitivity[allowed].max()) if allowed.any() else 0.0
 
 
+def union_area(boxes: np.ndarray) -> float:
+    """Точна площа об'єднання прямокутників x1, y1, x2, y2 (стиснення координат)."""
+    if not len(boxes):
+        return 0.0
+    xs, ys = np.unique(boxes[:, [0, 2]]), np.unique(boxes[:, [1, 3]])
+    covered = np.zeros((len(ys) - 1, len(xs) - 1), dtype=bool)
+    for x1, y1, x2, y2 in boxes:
+        covered[np.searchsorted(ys, y1):np.searchsorted(ys, y2), np.searchsorted(xs, x1):np.searchsorted(xs, x2)] = True
+    return float((np.outer(np.diff(ys), np.diff(xs)) * covered).sum())
+
+
+def expand_boxes(boxes: np.ndarray, pad: float) -> np.ndarray:
+    """Розширює кожну рамку на pad її ширини/висоти з кожного боку й обрізає по межах знімка."""
+    w, h = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
+    grown = np.stack([boxes[:, 0] - pad * w, boxes[:, 1] - pad * h, boxes[:, 2] + pad * w, boxes[:, 3] + pad * h], axis=1)
+    return np.clip(grown, 0.0, 1.0)
+
+
+def lesion_coverage(lesion: np.ndarray, rois: np.ndarray) -> float:
+    """Частка площі ураження (x1, y1, x2, y2), що лежить усередині об'єднання RoI."""
+    area = (lesion[2] - lesion[0]) * (lesion[3] - lesion[1])
+    if area <= 0 or not len(rois):
+        return 0.0
+    clipped = np.column_stack([np.maximum(rois[:, 0], lesion[0]), np.maximum(rois[:, 1], lesion[1]),
+                               np.minimum(rois[:, 2], lesion[2]), np.minimum(rois[:, 3], lesion[3])])
+    clipped = clipped[(clipped[:, 2] > clipped[:, 0]) & (clipped[:, 3] > clipped[:, 1])]
+    return union_area(clipped) / area
+
+
+def coverage_point(images, conf: float, pad: float, cover: float) -> dict:
+    """Покриття уражень і площа RoI при одному порозі conf і розширенні pad."""
+    protected, full, area_lesion, area_normal = [], [], [], []
+    for img in images:
+        rois = expand_boxes(img["boxes"][img["conf"] >= conf], pad)
+        area = union_area(rois)
+        if len(img["gt"]):
+            ok = [lesion_coverage(g[1:], rois) >= cover for g in img["gt"]]
+            protected += ok
+            full.append(all(ok))
+            area_lesion.append(area)
+        else:
+            area_normal.append(area)
+    nan = float("nan")
+    return {"protected": float(np.mean(protected)) if protected else nan,
+            "full_images": float(np.mean(full)) if full else nan,
+            "roi_area_lesion": float(np.mean(area_lesion)) if area_lesion else nan,
+            "roi_area_normal": float(np.mean(area_normal)) if area_normal else nan}
+
+
 def image_roc(images):
     """ROC "чи є на знімку ураження" за найвищою впевненістю RoI. None, якщо немає знімків одного з типів."""
     from sklearn.metrics import roc_auc_score, roc_curve
@@ -199,27 +277,31 @@ def image_roc(images):
 
 
 def analyze(dataset: str, weights: Path, split: str = "val", confs=(0.25, 0.1, 0.01), ious=(0.5, 0.3, 0.1),
-            imgsz=None, batch: int = 16):
-    """Рахує все й зберігає файли. Повертає {"metrics": {...}, "files": [...]} для логування в MLflow."""
+            imgsz=None, batch: int = 16, cover: float = 0.9, tta: bool = False):
+    """Рахує все й зберігає файли. Повертає {"metrics", "files", "tag"} для логування в MLflow.
+
+    tag — назва частини, з суфіксом -tta для TTA; входить у назви файлів і папку артефактів.
+    """
+    tag = f"{split}-tta" if tta else split
     yolo_dir = REPO_ROOT / "data" / dataset / "yolo"
     class_names = (yolo_dir / "classes.txt").read_text(encoding="utf-8").split("\n")[:-1]
     image_paths = sorted(p for p in (yolo_dir / "images" / split).iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
     ground_truth = load_ground_truth(yolo_dir / "labels" / split)
-    predictions, imgsz = predict(weights, image_paths, imgsz, batch)
+    predictions, imgsz = predict(weights, image_paths, imgsz, batch, augment=tta)
 
     images = []
     for path in image_paths:
         gt = ground_truth.get(path.stem, np.zeros((0, 5)))
         boxes, conf = predictions[path.stem]
-        images.append({"gt": gt, "conf": conf, "ious": iou_matrix(gt[:, 1:], boxes)})
+        images.append({"gt": gt, "boxes": boxes, "conf": conf, "ious": iou_matrix(gt[:, 1:], boxes)})
 
     out_dir = output_dir(dataset, weights)
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nВаги: {weights}  |  частина: {split}  |  imgsz: {imgsz}  |  знімків: {len(images)}")
+    print(f"\nВаги: {weights}  |  частина: {split}{'  |  TTA' if tta else ''}  |  imgsz: {imgsz}  |  знімків: {len(images)}")
 
     lines, header, csv_rows, metrics = recall_tables(images, class_names, confs, ious)
     print("\n".join(lines))
-    csv_path = out_dir / f"roi-recall-{split}.csv"
+    csv_path = out_dir / f"roi-recall-{tag}.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
@@ -238,10 +320,10 @@ def analyze(dataset: str, weights: Path, split: str = "val", confs=(0.25, 0.1, 0
         ax.plot(fp, sens, label=f"IoU ≥ {iou_thr} (CPM {cpm:.3f})")
     ax.set(xscale="log", xlim=(FROC_FP_RATES[0] / 2, FROC_FP_RATES[-1] * 2), ylim=(0, 1),
            xlabel="Хибних RoI на знімок", ylabel="Sensitivity (частка знайдених уражень)",
-           title=f"FROC — {dataset}, {split}")
+           title=f"FROC — {dataset}, {tag}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(loc="lower right")
-    froc_path = out_dir / f"froc-{split}.png"
+    froc_path = out_dir / f"froc-{tag}.png"
     fig.tight_layout()
     fig.savefig(froc_path, dpi=150)
     plt.close(fig)
@@ -258,24 +340,80 @@ def analyze(dataset: str, weights: Path, split: str = "val", confs=(0.25, 0.1, 0
         ax.plot(fpr, tpr, label=f"AUC {auc:.3f}")
         ax.plot([0, 1], [0, 1], "--", color="grey", linewidth=1)
         ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="False positive rate", ylabel="True positive rate",
-               title=f"ROC на рівні знімка — {dataset}, {split}")
+               title=f"ROC на рівні знімка — {dataset}, {tag}")
         ax.grid(True, alpha=0.3)
         ax.legend(loc="lower right")
-        roc_path = out_dir / f"roc-{split}.png"
+        roc_path = out_dir / f"roc-{tag}.png"
         fig.tight_layout()
         fig.savefig(roc_path, dpi=150)
         plt.close(fig)
         files.append(roc_path)
 
+    files += coverage_analysis(images, dataset, tag, cover, out_dir, metrics)
+
     print("\nФайли: " + ", ".join(str(p) for p in files))
-    return {"metrics": {f"roi_{split}/{key}": value for key, value in metrics.items()}, "files": files}
+    prefix = f"roi_{split}_tta" if tta else f"roi_{split}"
+    return {"metrics": {f"{prefix}/{key}": value for key, value in metrics.items()}, "files": files, "tag": tag}
 
 
-def log_to_mlflow(result: dict, split: str):
-    """Пише результат analyze() в активний запуск MLflow."""
+def coverage_analysis(images, dataset: str, split: str, cover: float, out_dir: Path, metrics: dict):
+    """Таблиця, CSV і графік "захищено уражень ↔ площа RoI"; дописує метрики в metrics. Повертає файли."""
+    has_normal = any(not len(img["gt"]) for img in images)
+    points = {(conf, pad): coverage_point(images, conf, pad, cover)
+              for pad in COVERAGE_PADS for conf in sorted(set(COVERAGE_CURVE_CONFS) | set(COVERAGE_TABLE_CONFS))}
+
+    print(f"\nПокриття уражень (захищене = ≥{cover:.0%} площі ураження всередині RoI):")
+    print(f"  {'conf':>5} {'розширення':>10} | {'уражень захищено':>16} {'хворих знімків повністю':>23} | "
+          f"{'площа RoI: хворі':>16} {'нормальні':>10}")
+    for conf in COVERAGE_TABLE_CONFS:
+        for pad in COVERAGE_PADS:
+            pt = points[(conf, pad)]
+            normal = f"{pt['roi_area_normal']:>10.1%}" if has_normal else f"{'—':>10}"
+            print(f"  {conf:>5} {f'+{pad:.0%}':>10} | {pt['protected']:>16.0%} {pt['full_images']:>23.0%} | "
+                  f"{pt['roi_area_lesion']:>16.1%} {normal}")
+            key = f"conf{conf}_pad{pad}"
+            metrics[f"coverage/protected_{key}"] = pt["protected"]
+            metrics[f"coverage/full_images_{key}"] = pt["full_images"]
+            metrics[f"coverage/roi_area_lesion_{key}"] = pt["roi_area_lesion"]
+            if has_normal:
+                metrics[f"coverage/roi_area_normal_{key}"] = pt["roi_area_normal"]
+
+    csv_path = out_dir / f"roi-coverage-{split}.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["conf", "pad", f"lesions_protected_cover{cover}", "lesion_images_fully_protected",
+                         "roi_area_lesion_images", "roi_area_normal_images"])
+        for (conf, pad), pt in sorted(points.items(), key=lambda kv: (kv[0][1], -kv[0][0])):
+            writer.writerow([conf, pad, *[round(pt[k], 4) for k in ("protected", "full_images", "roi_area_lesion",
+                                                                     "roi_area_normal")]])
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    for pad in COVERAGE_PADS:
+        curve = [points[(conf, pad)] for conf in COVERAGE_CURVE_CONFS]
+        ax.plot([100 * pt["roi_area_lesion"] for pt in curve], [pt["protected"] for pt in curve], marker="o",
+                markersize=3, label=f"розширення +{pad:.0%}")
+    # підписи порогів conf на одній з кривих, щоб можна було прочитати робочу точку
+    for conf in COVERAGE_TABLE_CONFS:
+        pt = points[(conf, 0.25)]
+        ax.annotate(f"conf {conf}", (100 * pt["roi_area_lesion"], pt["protected"]), textcoords="offset points",
+                    xytext=(4, -10), fontsize=7)
+    ax.set(ylim=(0, 1), xlabel="Площа RoI, % площі знімка (знімки з ураженнями)",
+           ylabel=f"Частка захищених уражень (≥{cover:.0%} площі в RoI)",
+           title=f"Покриття уражень — {dataset}, {split}")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+    png_path = out_dir / f"roi-coverage-{split}.png"
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+    return [csv_path, png_path]
+
+
+def log_to_mlflow(result: dict):
+    """Пише результат analyze() в активний запуск MLflow (артефакти — у roi-analysis-<tag>/)."""
     mlflow.log_metrics(result["metrics"])
     for path in result["files"]:
-        mlflow.log_artifact(str(path), artifact_path=f"roi-analysis-{split}")
+        mlflow.log_artifact(str(path), artifact_path=f"roi-analysis-{result['tag']}")
 
 
 def find_mlflow_run(dataset: str, run_name: str):
@@ -300,9 +438,14 @@ if __name__ == "__main__":
     parser.add_argument("--iou", type=float, nargs="+", default=[0.5, 0.3, 0.1], help="Пороги IoU для таблиць recall")
     parser.add_argument("--imgsz", type=int, default=None, help="Типово — той, з яким модель тренувалась")
     parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--cover", type=float, default=0.9,
+                        help="Ураження вважається захищеним, якщо така частка його площі всередині RoI")
+    parser.add_argument("--tta", action="store_true",
+                        help="Передбачення з аугментацією на інференсі (віддзеркалення + масштаби)")
     args = parser.parse_args()
 
-    result = analyze(args.dataset, args.weights, args.split, args.conf, args.iou, args.imgsz, args.batch)
+    result = analyze(args.dataset, args.weights, args.split, args.conf, args.iou, args.imgsz, args.batch, args.cover,
+                     args.tta)
     if mlflow is not None:
         run_name = output_dir(args.dataset, args.weights).name + ("" if args.split == "val" else f"-{args.split}")
         run_id = find_mlflow_run(args.dataset, run_name)
@@ -310,5 +453,6 @@ if __name__ == "__main__":
             print(f"У MLflow немає запуску '{run_name}' — результат лише у файлах.")
         else:
             with mlflow.start_run(run_id=run_id):
-                log_to_mlflow(result, args.split)
-            print(f"Записано в MLflow: запуск '{run_name}', метрики roi_{args.split}/*, артефакти roi-analysis-{args.split}/")
+                log_to_mlflow(result)
+            prefix = next(iter(result["metrics"])).split("/")[0]
+            print(f"Записано в MLflow: запуск '{run_name}', метрики {prefix}/*, артефакти roi-analysis-{result['tag']}/")

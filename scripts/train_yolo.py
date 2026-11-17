@@ -14,7 +14,20 @@
 Так само, як детектор RoI, оцінюють --eval-val і --eval-test. Саме roi_val/* — метрика
 для порівняння будь-яких моделей між собою. Разом з цим запускається analyze_roi_recall.py:
 recall по типах уражень, FROC і ROC на рівні знімка (де є знімки без уражень) — метрики
-roi_val/* і графіки в артефактах roi-analysis-val/.
+roi_val/* і графіки в артефактах roi-analysis-val/. З --tta аналіз додатково повторюється з
+аугментацією на інференсі (метрики roi_val_tta/*, артефакти roi-analysis-val-tta/).
+
+Рідкісні ураження можна показувати частіше: --oversample-rare T вмикає repeat factor sampling
+(Gupta et al., LVIS, CVPR 2019). Для класу c з часткою f(c) train-знімків, де він є, множник
+r(c) = max(1, sqrt(T / f(c))); знімок повторюється стільки разів, скільки найбільший множник
+серед його класів (дробова частина — стохастичне округлення з --seed). Знімки без уражень і
+з частими класами не повторюються. Список train пишеться в data/<датасет>/yolo/train-rfs<T>.txt,
+конфіг — у data-rfs<T>.yaml поруч; val і test не змінюються.
+
+Оптимізатор: типово optimizer=auto, і Ultralytics сам обирає AdamW з lr0 = 0.002·5/(4+nc), але
+якщо кроків тренування більше 10 000 (ceil(train-знімків / 64) · епохи) — MuSGD з lr0 0.01.
+Тобто збільшення епох чи датасету може непомітно змінити оптимізатор. Щоб порівнювати
+запуски чесно, задавайте його явно: --optimizer AdamW --lr0 0.002 (як auto для одного класу).
 
 Аугментація задається пресетом --aug:
     default      — типові налаштування Ultralytics (розраховані на фото COCO): mosaic 1.0,
@@ -34,7 +47,7 @@ roi_val/* і графіки в артефактах roi-analysis-val/.
 
 Якщо встановлено MLflow (pip install mlflow), кожен запуск додатково логується в
 експеримент "roi-detector/<датасет>": гіперпараметри, метрики по епохах, ваги та графіки —
-вбудованою інтеграцією Ultralytics, а цей скрипт додає теги (датасет, git-коміт, етап)
+вбудованою інтеграцією Ultralytics, а цей скрипт додає теги (датасет, git-коміт, етап),
 метрики roi_val/* і окремі запуски з метриками для --eval-val / --eval-test. База — mlflow.db у корені
 репозиторію, артефакти — mlartifacts/ (інше місце: змінна MLFLOW_TRACKING_URI).
 Перегляд: mlflow ui --backend-store-uri sqlite:///mlflow.db  ->  http://127.0.0.1:5000
@@ -48,18 +61,24 @@ roi_val/* і графіки в артефактах roi-analysis-val/.
     python scripts/train_yolo.py chestxray14 --epochs 50 --multi-class --cls-pw 0.5
     # оцінка вже натренованих ваг на val як детектора RoI (напр. для старих запусків)
     python scripts/train_yolo.py chestxray14 --eval-val runs/chestxray14/yolov8n-20261001-2315/weights/best.pt
+    # більша модель, більший вхід, довше, частіше рідкісні ураження, оптимізатор зафіксовано
+    python scripts/train_yolo.py vindr-spinexr --model yolov8s.pt --imgsz 1536 --batch 8 --epochs 80 \
+        --oversample-rare 0.1 --optimizer AdamW --lr0 0.002 --tta
     # фінальна оцінка на test — лише для остаточно обраної моделі
     python scripts/train_yolo.py chestxray14 --eval-test runs/chestxray14/yolov8n-20261001-2315/weights/best.pt
 """
 
 import argparse
+import math
 import os
+import random
 import subprocess
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from analyze_roi_recall import analyze, log_to_mlflow
+from analyze_roi_recall import IMAGE_SUFFIXES, analyze, log_to_mlflow
 from yolo_utils import REPO_ROOT, mlflow_tracking_uri
 
 try:
@@ -152,14 +171,57 @@ def print_results(split: str, results: dict):
     print(f"RoI {split}: " + ", ".join(f"{key} = {value:.4f}" for key, value in results.items()))
 
 
+def oversampled_data_yaml(dataset: str, threshold: float, seed: int):
+    """Repeat factor sampling для train (див. опис модуля). Повертає (шлях до yaml, параметри для MLflow)."""
+    yolo_dir = REPO_ROOT / "data" / dataset / "yolo"
+    class_names = (yolo_dir / "classes.txt").read_text(encoding="utf-8").split("\n")[:-1]
+    images = sorted(p for p in (yolo_dir / "images" / "train").iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+    classes_per_image = []
+    for image in images:
+        label = yolo_dir / "labels" / "train" / f"{image.stem}.txt"
+        lines = label.read_text(encoding="utf-8").splitlines() if label.exists() else []
+        classes_per_image.append({int(line.split()[0]) for line in lines if line.strip()})
+
+    image_count = Counter(c for classes in classes_per_image for c in classes)
+    class_repeat = {c: max(1.0, math.sqrt(threshold / (n / len(images)))) for c, n in image_count.items()}
+    rng = random.Random(seed)
+    entries = []
+    for image, classes in zip(images, classes_per_image):
+        repeat = max((class_repeat[c] for c in classes), default=1.0)
+        copies = int(repeat) + (rng.random() < repeat - int(repeat))  # стохастичне округлення
+        entries += [str(image)] * copies
+
+    list_path = yolo_dir / f"train-rfs{threshold}.txt"
+    list_path.write_text("\n".join(entries) + "\n", encoding="utf-8", newline="\n")
+    base_yaml = data_yaml_path(dataset).read_text(encoding="utf-8")
+    assert "train: images/train" in base_yaml, "неочікуваний формат data.yaml"
+    yaml_path = yolo_dir / f"data-rfs{threshold}.yaml"
+    yaml_path.write_text(base_yaml.replace("train: images/train", f"train: {list_path.name}"),
+                         encoding="utf-8", newline="\n")
+
+    print(f"Repeat factor sampling (T={threshold}): train {len(images)} -> {len(entries)} знімків; множники: "
+          + ", ".join(f"{class_names[c]} ×{r:.2f}" for c, r in sorted(class_repeat.items())))
+    params = {"oversample_rare": threshold, "train_images_original": len(images), "train_images_oversampled": len(entries)}
+    params.update({f"repeat_factor.{class_names[c]}": round(r, 3) for c, r in class_repeat.items()})
+    return yaml_path, params
+
+
 def train(args):
     run_name = f"{args.name or Path(args.model).stem}-{datetime.now():%Y%m%d-%H%M}"
     imgsz = args.imgsz or 640
+    data_yaml, data_params = data_yaml_path(args.dataset), {}
+    if args.oversample_rare:
+        data_yaml, data_params = oversampled_data_yaml(args.dataset, args.oversample_rare, args.seed)
+    # lr0 передається лише коли заданий: з optimizer=auto Ultralytics його однаково ігнорує
+    optimizer_args = {"optimizer": args.optimizer, **({"lr0": args.lr0} if args.lr0 is not None else {})}
     model = YOLO(args.model)
     with mlflow_run(args.dataset, run_name, stage="train", tags={"aug": args.aug}) as run:
+        if run and data_params:
+            mlflow.log_params(data_params)
         model.train(
             **AUG_PRESETS[args.aug],
-            data=str(data_yaml_path(args.dataset)),
+            **optimizer_args,
+            data=str(data_yaml),
             epochs=args.epochs,
             imgsz=imgsz,
             batch=args.batch,
@@ -173,10 +235,12 @@ def train(args):
         )
         run_dir = Path(model.trainer.save_dir)
         _, results = evaluate_roi(YOLO(model.trainer.best), args.dataset, "val", imgsz, args, run_dir / "roi-val")
-        analysis = analyze(args.dataset, Path(model.trainer.best), "val", imgsz=imgsz, batch=args.batch)
+        analyses = [analyze(args.dataset, Path(model.trainer.best), "val", imgsz=imgsz, batch=args.batch, tta=tta)
+                    for tta in ([False, True] if args.tta else [False])]
         if run:
             mlflow.log_metrics({f"roi_val/{key}": value for key, value in results.items()})
-            log_to_mlflow(analysis, "val")
+            for analysis in analyses:
+                log_to_mlflow(analysis)
     print_results("val", results)
 
 
@@ -193,9 +257,11 @@ def evaluate(args, split: str, weights: Path):
     imgsz = args.imgsz or train_args.get("imgsz", 640)  # типово — той самий розмір, що й під час тренування
     with mlflow_run(args.dataset, run_name, stage=split) as run:
         metrics, results = evaluate_roi(model, args.dataset, split, imgsz, args, run_dir / f"roi-{split}")
-        analysis = analyze(args.dataset, weights, split, imgsz=imgsz, batch=args.batch)
+        analyses = [analyze(args.dataset, weights, split, imgsz=imgsz, batch=args.batch, tta=tta)
+                    for tta in ([False, True] if args.tta else [False])]
         if run:
-            log_to_mlflow(analysis, split)
+            for analysis in analyses:
+                log_to_mlflow(analysis)
             mlflow.log_params({"weights": str(weights), "split": split, "imgsz": imgsz})
             mlflow.log_params({f"train.{key}": train_args[key] for key in
                                ("model", "epochs", "imgsz", "single_cls", "cls_pw", "seed", "fraction")
@@ -225,6 +291,14 @@ if __name__ == "__main__":
                              "класу (Ultralytics cls_pw). Лише разом з --multi-class")
     parser.add_argument("--aug", choices=AUG_PRESETS, default="default",
                         help="Пресет аугментації: default (Ultralytics), xray, xray-mosaic, nomosaic — див. опис вище")
+    parser.add_argument("--oversample-rare", type=float, default=0.0, metavar="T",
+                        help="Repeat factor sampling: частіше показувати знімки з рідкісними ураженнями "
+                             "(типове значення для спроби — 0.1; 0 — вимкнено)")
+    parser.add_argument("--optimizer", default="auto", choices=("auto", "AdamW", "SGD", "MuSGD"),
+                        help="auto сам перемикається з AdamW на MuSGD, якщо кроків > 10 000 — див. опис вище")
+    parser.add_argument("--lr0", type=float, default=None, help="Початковий learning rate (з --optimizer auto ігнорується)")
+    parser.add_argument("--tta", action="store_true",
+                        help="Додатково оцінити з аугментацією на інференсі (метрики roi_val_tta/*)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--name", default=None, help="Назва запуску в runs/<датасет>/ і в MLflow (типово — назва моделі); "
                              "дата й час старту додаються до неї завжди")
@@ -239,6 +313,10 @@ if __name__ == "__main__":
         parser.error("--cls-pw має бути в межах [0, 1]")
     if args.cls_pw and not args.multi_class:
         parser.error("--cls-pw діє лише з --multi-class: з одним класом RoI зважувати нічого")
+    if not 0.0 <= args.oversample_rare < 1.0:
+        parser.error("--oversample-rare має бути в межах [0, 1)")
+    if args.lr0 is not None and args.optimizer == "auto":
+        parser.error("--lr0 з --optimizer auto ігнорується Ultralytics — задайте й --optimizer")
 
     if args.eval_val:
         evaluate(args, "val", args.eval_val)
